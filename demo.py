@@ -45,6 +45,24 @@ def _load_config():
         val = lc.get(key)
         return list(val) if val else []
 
+    def _policy_actions(key, env_key):
+        env_val = os.environ.get(env_key, "").strip()
+        if env_val:
+            return [x.strip() for x in env_val.split(",") if x.strip()]
+        val = lc.get(key)
+        if isinstance(val, (list, tuple)):
+            return [str(x).strip() for x in val if str(x).strip()]
+        if isinstance(val, str) and val.strip():
+            return [x.strip() for x in val.split(",") if x.strip()]
+        return []
+
+    def _int(key, env_key, default):
+        raw = _str(key, env_key, str(default))
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
     return {
         "APP_ID": _str("APP_ID", "FEISHU_APP_ID"),
         "APP_SECRET": _str("APP_SECRET", "FEISHU_APP_SECRET"),
@@ -52,6 +70,11 @@ def _load_config():
         "AUDIT_WIKI_SEED_NODE": _str("AUDIT_WIKI_SEED_NODE", "FEISHU_WIKI_SEED_NODE"),
         "AUDIT_WIKI_SPACE_IDS": _list("AUDIT_WIKI_SPACE_IDS", "FEISHU_WIKI_SPACE_IDS"),
         "AUDIT_DOC_TOKENS": _list("AUDIT_DOC_TOKENS", "FEISHU_AUDIT_DOC_TOKENS"),
+        "AUDIT_POLICY_ACTIONS": _policy_actions("AUDIT_POLICY_ACTIONS", "FEISHU_AUDIT_POLICY_ACTIONS"),
+        "AUDIT_MASK_TEXT": _str("AUDIT_MASK_TEXT", "FEISHU_AUDIT_MASK_TEXT", "***"),
+        "AUDIT_NOTIFY_USER_IDS": _list("AUDIT_NOTIFY_USER_IDS", "FEISHU_AUDIT_NOTIFY_USER_IDS"),
+        "AUDIT_HIGHLIGHT_COLOR": _int("AUDIT_HIGHLIGHT_COLOR", "FEISHU_AUDIT_HIGHLIGHT_COLOR", 3),
+        "AUDIT_LOCK_RESTRICT_SHARE": _str("AUDIT_LOCK_RESTRICT_SHARE", "FEISHU_AUDIT_LOCK_RESTRICT_SHARE", "closed"),
     }
 
 
@@ -62,6 +85,10 @@ AUDIT_ROOT_FOLDER_TOKEN = _cfg["AUDIT_ROOT_FOLDER_TOKEN"]
 AUDIT_WIKI_SPACE_IDS = _cfg["AUDIT_WIKI_SPACE_IDS"]
 AUDIT_WIKI_SEED_NODE = _cfg["AUDIT_WIKI_SEED_NODE"]
 AUDIT_DOC_TOKENS = _cfg["AUDIT_DOC_TOKENS"]
+AUDIT_MASK_TEXT = _cfg["AUDIT_MASK_TEXT"] or "***"
+AUDIT_NOTIFY_USER_IDS = _cfg["AUDIT_NOTIFY_USER_IDS"]
+AUDIT_HIGHLIGHT_COLOR = _cfg["AUDIT_HIGHLIGHT_COLOR"]
+AUDIT_LOCK_RESTRICT_SHARE = _cfg["AUDIT_LOCK_RESTRICT_SHARE"] or ""
 
 if not APP_ID or not APP_SECRET:
     raise SystemExit(
@@ -71,6 +98,11 @@ if not APP_ID or not APP_SECRET:
 
 # 敏感词库（demo 示例，可按需扩展或接入大模型）
 SENSITIVE_WORDS = ["违禁词", "测试敏感", "暴力", "赌博"]
+
+# 审核未通过时的处理策略（可在 local_config.py 覆盖）
+# 可选：log_only | highlight | replace | lock | notify
+VALID_AUDIT_ACTIONS = frozenset({"log_only", "highlight", "replace", "lock", "notify"})
+AUDIT_POLICY_ACTIONS = _cfg["AUDIT_POLICY_ACTIONS"] or ["log_only"]
 
 # 手动配置要全量审核的文档 token（应用已添加为「文档应用」的文档）
 # 见上方 AUDIT_DOC_TOKENS（local_config.py / 环境变量）
@@ -379,6 +411,7 @@ def diagnose_event_monitoring(folder_token=None):
             "删除事件需额外权限 docs:event.document_deleted:read",
             "编辑能收到但权限/删除收不到 → 典型原因是应用只是管理者而非所有者",
         ],
+        "audit_policy": get_audit_policy_config(),
     }
 
 
@@ -742,6 +775,11 @@ def audit_file(file_token, file_type="docx", source="manual", title=None):
         print(f"✅ [{source}] {label} 审核通过，共 {len(content)} 字")
     else:
         print(f"⚠️ [{source}] {label} 未通过，命中: {moderation['hits']}")
+        policy_result = apply_audit_policies(
+            file_token, ftype, moderation, title=title, source=source,
+        )
+        if policy_result:
+            result["policy_actions"] = policy_result
 
     return result
 
@@ -1399,10 +1437,17 @@ def _extract_rich_text(content_obj):
     mentioned = []
     if isinstance(content_obj, dict):
         elem_type = content_obj.get("type")
+        text_run = content_obj.get("text_run")
+        if isinstance(text_run, dict):
+            run_text = text_run.get("content") or text_run.get("text")
+            if run_text:
+                texts.append(str(run_text))
         if elem_type == "text_run":
             tr = content_obj.get("text_run") or {}
             if tr.get("text"):
                 texts.append(str(tr["text"]))
+            elif tr.get("content"):
+                texts.append(str(tr["content"]))
         elif elem_type == "person":
             person = content_obj.get("person") or {}
             uid = person.get("user_id") or person.get("open_id") or person.get("union_id")
@@ -1733,6 +1778,403 @@ def fetch_docx_block_texts(document_id):
         if text:
             block_map[block.get("block_id")] = text
     return block_map, None
+
+
+# ==========================================
+# 审核处理策略（高亮 / 替换 / 锁定 / 通知）
+# ==========================================
+def normalize_audit_actions(actions=None):
+    """解析并去重策略列表；与具体动作并存时忽略 log_only。"""
+    raw = actions if actions is not None else AUDIT_POLICY_ACTIONS
+    normalized = []
+    for item in raw or []:
+        key = str(item).strip().lower()
+        if key in VALID_AUDIT_ACTIONS and key not in normalized:
+            normalized.append(key)
+    if not normalized:
+        return ["log_only"]
+    if len(normalized) > 1 and "log_only" in normalized:
+        normalized = [a for a in normalized if a != "log_only"]
+    return normalized
+
+
+def get_audit_policy_config():
+    actions = normalize_audit_actions()
+    return {
+        "actions": actions,
+        "mask_text": AUDIT_MASK_TEXT,
+        "notify_user_ids": AUDIT_NOTIFY_USER_IDS,
+        "highlight_color": AUDIT_HIGHLIGHT_COLOR,
+        "lock_restrict_share": AUDIT_LOCK_RESTRICT_SHARE or None,
+        "descriptions": {
+            "log_only": "仅记录审核结果，不修改文档",
+            "highlight": "docx：敏感词高亮（背景色）",
+            "replace": "docx：敏感词替换为占位符",
+            "lock": "加锁并可选关闭链接分享",
+            "notify": "飞书 IM 通知负责人",
+        },
+    }
+
+
+def _sensitive_word_pattern(words):
+    unique = [re.escape(w) for w in dict.fromkeys(words or []) if w]
+    if not unique:
+        return None
+    return re.compile("|".join(unique))
+
+
+def build_text_elements_for_policy(text, sensitive_words, action, mask_text=None, highlight_color=None):
+    """将文本拆成飞书 update_text_elements 所需的 elements 列表。"""
+    if not text:
+        return [{"text_run": {"content": ""}}]
+
+    pattern = _sensitive_word_pattern(sensitive_words)
+    if not pattern or action not in ("highlight", "replace"):
+        return [{"text_run": {"content": text}}]
+
+    mask = mask_text if mask_text is not None else AUDIT_MASK_TEXT
+    color = highlight_color if highlight_color is not None else AUDIT_HIGHLIGHT_COLOR
+    elements = []
+    last = 0
+    for match in pattern.finditer(text):
+        if match.start() > last:
+            elements.append({"text_run": {"content": text[last:match.start()]}})
+        if action == "highlight":
+            elements.append({
+                "text_run": {
+                    "content": match.group(),
+                    "text_element_style": {"background_color": color},
+                }
+            })
+        else:
+            elements.append({"text_run": {"content": mask}})
+        last = match.end()
+    if last < len(text):
+        elements.append({"text_run": {"content": text[last:]}})
+    return elements or [{"text_run": {"content": text}}]
+
+
+def patch_docx_block_elements(document_id, block_id, elements):
+    """PATCH 单个 docx block 的文本元素。"""
+    headers = _auth_headers()
+    if not headers:
+        return False, "无法获取 token"
+
+    url = (
+        f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"
+        f"/blocks/{block_id}"
+    )
+    payload = {"update_text_elements": {"elements": elements}}
+    try:
+        res = requests.patch(url, headers=headers, json=payload, timeout=30)
+        data = res.json()
+    except requests.RequestException as e:
+        return False, str(e)
+
+    if data.get("code") != 0:
+        return False, data.get("msg", "更新 block 失败")
+    return True, None
+
+
+def batch_patch_docx_blocks(document_id, block_updates):
+    """批量更新 docx blocks（单次最多按飞书限制分批）。"""
+    if not block_updates:
+        return {"ok": True, "blocks_updated": 0, "errors": []}
+
+    headers = _auth_headers()
+    if not headers:
+        return {"ok": False, "blocks_updated": 0, "errors": ["无法获取 token"]}
+
+    url = (
+        f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"
+        f"/blocks/batch_update"
+    )
+    updated = 0
+    errors = []
+    chunk_size = 20
+    for i in range(0, len(block_updates), chunk_size):
+        chunk = block_updates[i:i + chunk_size]
+        requests_body = [
+            {
+                "block_id": item["block_id"],
+                "update_text_elements": {"elements": item["elements"]},
+            }
+            for item in chunk
+        ]
+        try:
+            res = requests.patch(
+                url, headers=headers, json={"requests": requests_body}, timeout=60,
+            )
+            data = res.json()
+        except requests.RequestException as e:
+            errors.append(str(e))
+            continue
+
+        if data.get("code") != 0:
+            errors.append(data.get("msg", "batch_update 失败"))
+            continue
+        updated += len(chunk)
+
+    return {
+        "ok": not errors,
+        "blocks_updated": updated,
+        "errors": errors,
+    }
+
+
+def apply_docx_content_policy(file_token, hits, action, mask_text=None, highlight_color=None):
+    """对 docx 中含敏感词的 block 执行高亮或替换。"""
+    if action not in ("highlight", "replace"):
+        return {"ok": False, "skipped": True, "reason": f"未知动作: {action}"}
+
+    block_map, err = fetch_docx_block_texts(file_token)
+    if err:
+        return {"ok": False, "error": err}
+    if not block_map:
+        return {"ok": True, "blocks_updated": 0, "note": "无文本 block"}
+
+    pattern = _sensitive_word_pattern(hits)
+    updates = []
+    for block_id, text in block_map.items():
+        if not pattern or not pattern.search(text):
+            continue
+        elements = build_text_elements_for_policy(
+            text, hits, action, mask_text=mask_text, highlight_color=highlight_color,
+        )
+        updates.append({"block_id": block_id, "elements": elements})
+
+    if not updates:
+        return {"ok": True, "blocks_updated": 0, "note": "未命中可更新的 block"}
+
+    result = batch_patch_docx_blocks(file_token, updates)
+    if result.get("blocks_updated"):
+        save_content_snapshot(file_token, "docx")
+    return {
+        "ok": result.get("ok", False),
+        "action": action,
+        "blocks_updated": result.get("blocks_updated", 0),
+        "errors": result.get("errors") or [],
+    }
+
+
+def update_public_permission(file_token, file_type, lock_switch=None, link_share_entity=None):
+    """更新云文档公开权限（加锁 / 收紧分享）。"""
+    headers = _auth_headers()
+    if not headers:
+        return False, "无法获取 token"
+
+    ftype = normalize_file_type(file_type)
+    body = {}
+    if lock_switch is not None:
+        body["lock_switch"] = bool(lock_switch)
+    if link_share_entity:
+        body["link_share_entity"] = link_share_entity
+    if not body:
+        return False, "无更新字段"
+
+    url = f"https://open.feishu.cn/open-apis/drive/v1/permissions/{file_token}/public"
+    try:
+        res = requests.patch(
+            url, headers=headers, params={"type": ftype}, json=body, timeout=15,
+        )
+        data = res.json()
+    except requests.RequestException as e:
+        return False, str(e)
+
+    if data.get("code") != 0:
+        return False, data.get("msg", "更新权限失败")
+    return True, data.get("data", {}).get("permission_public")
+
+
+def apply_lock_policy(file_token, file_type):
+    """
+    文档加锁并可选收紧分享。
+    wiki 节点可设置 lock_switch；普通 docx 通过关闭/收紧链接分享实现等效锁定。
+    """
+    known = load_known_docs().get(file_token, {})
+    is_wiki = bool(known.get("wiki_space_id")) or normalize_file_type(file_type) == "wiki"
+    result = {"ok": False, "is_wiki": is_wiki}
+
+    if is_wiki:
+        ok, detail = update_public_permission(file_token, file_type, lock_switch=True)
+        result["lock_switch_attempt"] = True
+        result["lock_switch_ok"] = ok
+        if ok:
+            result["ok"] = True
+            if isinstance(detail, dict):
+                result["permission_public"] = detail
+        else:
+            result["lock_switch_error"] = detail
+
+    restrict = AUDIT_LOCK_RESTRICT_SHARE or "closed"
+    if restrict:
+        ok2, detail2 = update_public_permission(
+            file_token, file_type, link_share_entity=restrict,
+        )
+        result["restrict_share"] = restrict
+        result["restrict_ok"] = ok2
+        if ok2:
+            result["ok"] = True
+            result["method"] = "restrict_share" if not is_wiki else "lock_switch+restrict_share"
+            if isinstance(detail2, dict):
+                result["permission_public"] = detail2
+        elif not ok2:
+            result["restrict_error"] = detail2
+
+    return result
+
+
+def resolve_notify_targets(file_token, file_type):
+    """解析通知接收人：配置列表 > 文档所有者 > 可管理协作者。"""
+    if AUDIT_NOTIFY_USER_IDS:
+        return [
+            {"receive_id": uid, "receive_id_type": "open_id"}
+            for uid in AUDIT_NOTIFY_USER_IDS
+        ]
+
+    meta, _ = fetch_file_metadata(file_token, file_type)
+    if meta and meta.get("owner_id"):
+        return [{"receive_id": meta["owner_id"], "receive_id_type": "open_id"}]
+
+    members, err = list_permission_members(file_token, file_type)
+    if err or not members:
+        return []
+
+    for member in members:
+        norm = _normalize_member(member)
+        if norm.get("perm") != "full_access":
+            continue
+        mid = norm.get("member_id")
+        if mid:
+            return [{"receive_id": mid, "receive_id_type": "open_id"}]
+    return []
+
+
+def send_im_text_message(receive_id, text, receive_id_type="open_id"):
+    """发送飞书文本消息。"""
+    headers = _auth_headers()
+    if not headers:
+        return False, "无法获取 token"
+
+    url = "https://open.feishu.cn/open-apis/im/v1/messages"
+    params = {"receive_id_type": receive_id_type}
+    payload = {
+        "receive_id": receive_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}, ensure_ascii=False),
+    }
+    try:
+        res = requests.post(url, headers=headers, params=params, json=payload, timeout=15)
+        data = res.json()
+    except requests.RequestException as e:
+        return False, str(e)
+
+    if data.get("code") != 0:
+        return False, data.get("msg", "发送消息失败")
+    return True, data.get("data", {})
+
+
+def apply_notify_policy(file_token, file_type, hits, title=None):
+    """通知文档负责人审核未通过。"""
+    targets = resolve_notify_targets(file_token, file_type)
+    if not targets:
+        return {"ok": False, "error": "未找到通知接收人（请配置 AUDIT_NOTIFY_USER_IDS）"}
+
+    meta, _ = fetch_file_metadata(file_token, file_type)
+    doc_title = title or (meta or {}).get("title") or file_token
+    doc_url = (meta or {}).get("url") or ""
+    hits_text = "、".join(hits) if hits else "（未知）"
+    lines = [
+        "【文档审核告警】",
+        f"文档：{doc_title}",
+        f"命中敏感词：{hits_text}",
+        "请及时处理。",
+    ]
+    if doc_url:
+        lines.append(f"链接：{doc_url}")
+    message = "\n".join(lines)
+
+    sent = []
+    errors = []
+    for target in targets:
+        ok, detail = send_im_text_message(
+            target["receive_id"], message, target.get("receive_id_type", "open_id"),
+        )
+        if ok:
+            sent.append(target["receive_id"])
+        else:
+            errors.append({"receive_id": target["receive_id"], "error": detail})
+
+    return {
+        "ok": bool(sent) and not errors,
+        "sent_to": sent,
+        "errors": errors,
+    }
+
+
+def apply_audit_policies(file_token, file_type, moderation, title=None, source="manual", actions=None):
+    """
+    审核未通过后按配置执行处理策略。
+    返回各动作执行结果；仅 log_only 时返回简要说明。
+    """
+    actions = normalize_audit_actions(actions)
+    hits = moderation.get("hits") or []
+    ftype = normalize_file_type(file_type)
+
+    result = {
+        "configured_actions": actions,
+        "source": source,
+        "results": {},
+        "skipped": [],
+    }
+
+    if "log_only" in actions and len(actions) == 1:
+        result["note"] = "仅记录审核结果"
+        return result
+
+    for action in actions:
+        if action == "log_only":
+            continue
+
+        if action in ("highlight", "replace"):
+            if ftype != "docx":
+                result["skipped"].append({
+                    "action": action,
+                    "reason": f"{ftype} 类型暂仅 docx 支持正文高亮/替换",
+                })
+                continue
+            policy_result = apply_docx_content_policy(
+                file_token, hits, action,
+                mask_text=AUDIT_MASK_TEXT,
+                highlight_color=AUDIT_HIGHLIGHT_COLOR,
+            )
+            result["results"][action] = policy_result
+            label = "高亮" if action == "highlight" else "替换"
+            if policy_result.get("ok"):
+                print(
+                    f"   🛠️ [{source}] {label}完成: "
+                    f"{policy_result.get('blocks_updated', 0)} 个 block"
+                )
+            else:
+                print(f"   ⚠️ [{source}] {label}失败: {policy_result}")
+
+        elif action == "lock":
+            policy_result = apply_lock_policy(file_token, ftype)
+            result["results"]["lock"] = policy_result
+            if policy_result.get("ok"):
+                print(f"   🔒 [{source}] 文档已加锁")
+            else:
+                print(f"   ⚠️ [{source}] 加锁失败: {policy_result.get('error')}")
+
+        elif action == "notify":
+            policy_result = apply_notify_policy(file_token, ftype, hits, title=title)
+            result["results"]["notify"] = policy_result
+            if policy_result.get("sent_to"):
+                print(f"   📨 [{source}] 已通知: {policy_result['sent_to']}")
+            else:
+                print(f"   ⚠️ [{source}] 通知失败: {policy_result}")
+
+    return result
 
 
 def _split_paragraphs(text):
@@ -2196,6 +2638,7 @@ def log_document_event(event_type, file_token, file_type, event_payload, header=
             "hits": audit_result.get("hits"),
             "summary": audit_result.get("summary"),
             "error": audit_result.get("error"),
+            "policy_actions": audit_result.get("policy_actions"),
         }
 
     try:
@@ -2815,6 +3258,7 @@ def home():
         "<li>POST /audit/all — 全量审核共享文件夹内所有云文档</li>"
         "<li>POST /audit/export — 从权限审计导出文件批量审核</li>"
         "<li>GET /audit/one?file_token=xxx — 审核单篇文档</li>"
+        "<li>GET /audit/policy — 查看当前审核处理策略配置</li>"
         "<li>POST /subscribe/all — 订阅文件夹新建 + 已有文件事件（含权限变更）</li>"
         "<li>GET /events — 查看最近文档事件日志</li>"
         "<li>GET /activities — 按采集表查看用户行为（create/view/edit/…）</li>"
@@ -2828,6 +3272,7 @@ def home():
         "<p>实时(webhook)：新建、编辑、评论(drive.notice.comment_add_v1) | 轮询：权限/转发、删除、分享、评论兜底</p>"
         "<p>评论 Webhook：开放平台添加 drive.notice.comment_add_v1，URL 同 /webhook，权限 docs:document.comment:read</p>"
         "<p>查看/下载：飞书开放 API 无对应事件，请用 /track/view、/track/download 埋点补充</p>"
+        f"<p>审核策略：{', '.join(normalize_audit_actions())}（详见 GET /audit/policy）</p>"
     )
 
 
@@ -3073,6 +3518,31 @@ def audit_one_route():
         return jsonify({"error": "缺少 file_token"}), 400
     result = audit_file(file_token, file_type=file_type, source="api")
     return jsonify(result)
+
+
+@app.route("/audit/policy", methods=["GET"])
+def audit_policy_route():
+    """查看当前审核处理策略及所需开放平台权限。"""
+    actions = normalize_audit_actions()
+    permissions = ["docs:document.content:read"]
+    if "highlight" in actions or "replace" in actions:
+        permissions.append("docx:document 或 docx:document:write_only（高亮/替换 docx 正文）")
+    if "lock" in actions:
+        permissions.append("docs:permission.setting:write_only（加锁/收紧分享）")
+    if "notify" in actions:
+        permissions.append("im:message 或 im:message:send_as_bot（通知负责人）")
+    return jsonify({
+        **get_audit_policy_config(),
+        "sensitive_words_count": len(SENSITIVE_WORDS),
+        "required_permissions": list(dict.fromkeys(permissions)),
+        "example_config": {
+            "AUDIT_POLICY_ACTIONS": ["replace", "notify"],
+            "AUDIT_MASK_TEXT": "***",
+            "AUDIT_NOTIFY_USER_IDS": ["ou_xxxxxxxx"],
+            "AUDIT_HIGHLIGHT_COLOR": 3,
+            "AUDIT_LOCK_RESTRICT_SHARE": "closed",
+        },
+    })
 
 
 @app.route("/audit/export", methods=["POST"])
