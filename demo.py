@@ -75,6 +75,7 @@ def _load_config():
         "AUDIT_NOTIFY_USER_IDS": _list("AUDIT_NOTIFY_USER_IDS", "FEISHU_AUDIT_NOTIFY_USER_IDS"),
         "AUDIT_HIGHLIGHT_COLOR": _int("AUDIT_HIGHLIGHT_COLOR", "FEISHU_AUDIT_HIGHLIGHT_COLOR", 3),
         "AUDIT_LOCK_RESTRICT_SHARE": _str("AUDIT_LOCK_RESTRICT_SHARE", "FEISHU_AUDIT_LOCK_RESTRICT_SHARE", "closed"),
+        "POLL_INTERVAL_SECONDS": _int("POLL_INTERVAL_SECONDS", "FEISHU_POLL_INTERVAL_SECONDS", 60),
     }
 
 
@@ -95,6 +96,8 @@ if not APP_ID or not APP_SECRET:
         "缺少飞书应用凭证：请复制 local_config.example.py 为 local_config.py 并填写 APP_ID/APP_SECRET，"
         "或设置环境变量 FEISHU_APP_ID、FEISHU_APP_SECRET"
     )
+
+app.config["JSON_AS_ASCII"] = False
 
 # 敏感词库（demo 示例，可按需扩展或接入大模型）
 SENSITIVE_WORDS = ["违禁词", "测试敏感", "暴力", "赌博"]
@@ -205,7 +208,7 @@ WEBHOOK_DEBUG_LOG = os.path.join(os.path.dirname(__file__), "webhook_debug.jsonl
 # 方案 B：轮询监听（权限变更 + 文件删除，不依赖文档所有者 webhook）
 PERMISSION_SNAPSHOT_FILE = os.path.join(os.path.dirname(__file__), "permission_snapshot.json")
 FOLDER_FILES_SNAPSHOT_FILE = os.path.join(os.path.dirname(__file__), "folder_files_snapshot.json")
-POLL_INTERVAL_SECONDS = 300
+POLL_INTERVAL_SECONDS = _cfg["POLL_INTERVAL_SECONDS"]
 AUTO_POLL_ON_START = True
 POLLABLE_PERMISSION_TYPES = frozenset({"docx", "doc", "sheet", "bitable", "slides", "file"})
 
@@ -224,6 +227,8 @@ AUDIT_FILE_TYPES = frozenset({
 })
 # 可通过开放 API 读取正文并做敏感词审核的类型
 AUDITABLE_CONTENT_TYPES = frozenset({"docx", "doc", "sheet", "bitable", "slides"})
+# 支持正文高亮/替换的策略类型（其余类型仍可 lock / notify）
+CONTENT_REPLACEABLE_TYPES = frozenset({"docx"})
 # 飞书 API 暂不支持读取正文的类型（仍会出现在扫描列表里并标注跳过原因）
 UNSUPPORTED_CONTENT_TYPES = frozenset({"mindnote"})
 
@@ -611,10 +616,10 @@ def fetch_bitable_content(app_token):
         page_token = None
         record_texts = []
         while True:
-            body = {"page_size": 500}
+            body = {"page_size": 500, "automatic_fields": True}
             if page_token:
                 body["page_token"] = page_token
-            search_res = requests.post(search_url, headers=headers, json=body)
+            search_res = requests.post(search_url, headers=headers, json=body, timeout=30)
             search_data = search_res.json()
             if search_data.get("code") != 0:
                 record_texts.append(f"读取失败: {search_data.get('msg', '')}")
@@ -769,6 +774,7 @@ def audit_file(file_token, file_type="docx", source="manual", title=None):
         "summary": moderation["summary"],
         "preview": preview,
         "char_count": len(content),
+        "content_replace_supported": ftype in CONTENT_REPLACEABLE_TYPES,
     }
 
     if moderation["passed"]:
@@ -1061,7 +1067,7 @@ def collect_docs_for_audit(folder_token=None):
 
 
 def collect_docs_for_poll(folder_token=None):
-    """轮询用：仅共享文件夹 + wiki，不含 known_docs 里可能已删除的 token"""
+    """轮询用：文件夹 + wiki + 配置 token + Webhook 已登记的 known_docs"""
     root = folder_token if folder_token is not None else AUDIT_ROOT_FOLDER_TOKEN
     merged = {}
 
@@ -1087,6 +1093,26 @@ def collect_docs_for_poll(folder_token=None):
                     "node_token": item.get("node_token"),
                     "wiki_space_id": item.get("space_id") or space_id,
                 }
+
+    for token in AUDIT_DOC_TOKENS:
+        if token:
+            merged[token] = merged.get(token, {
+                "title": None,
+                "file_type": "docx",
+                "from": "config",
+            })
+
+    for token, meta in load_known_docs().items():
+        entry = merged.get(token, {
+            "title": meta.get("title"),
+            "file_type": meta.get("file_type", "docx"),
+            "from": "registry",
+        })
+        if not entry.get("title"):
+            entry["title"] = meta.get("title")
+        if not entry.get("file_type"):
+            entry["file_type"] = meta.get("file_type", "docx")
+        merged[token] = entry
 
     return merged
 
@@ -2137,10 +2163,13 @@ def apply_audit_policies(file_token, file_type, moderation, title=None, source="
             continue
 
         if action in ("highlight", "replace"):
-            if ftype != "docx":
+            if ftype not in CONTENT_REPLACEABLE_TYPES:
                 result["skipped"].append({
                     "action": action,
-                    "reason": f"{ftype} 类型暂仅 docx 支持正文高亮/替换",
+                    "reason": (
+                        f"{ftype} 类型仅支持审核与 lock/notify；"
+                        f"正文高亮/替换目前仅支持 docx"
+                    ),
                 })
                 continue
             policy_result = apply_docx_content_policy(
@@ -2805,6 +2834,39 @@ def list_permission_members(file_token, file_type):
     return members, None
 
 
+def transfer_document_owner(file_token, file_type, member_id, member_type="openid",
+                            remove_old_owner=False, old_owner_perm="full_access"):
+    """
+    转移云文档所有者。
+    文档由应用创建时，调用方需为当前所有者（应用 tenant_access_token）。
+    参考：https://open.feishu.cn/document/server-docs/docs/permission/permission-member/transfer_owner
+    """
+    headers = _auth_headers()
+    if not headers:
+        return {"ok": False, "error": "无法获取 token"}
+
+    ftype = normalize_file_type(file_type)
+    url = (
+        f"https://open.feishu.cn/open-apis/drive/v1/permissions/{file_token}"
+        f"/members/transfer_owner"
+    )
+    params = {
+        "type": ftype,
+        "remove_old_owner": remove_old_owner,
+        "old_owner_perm": old_owner_perm,
+    }
+    body = {"member_type": member_type, "member_id": member_id}
+    try:
+        res = requests.post(url, headers=headers, params=params, json=body, timeout=30)
+        data = res.json()
+    except requests.RequestException as e:
+        return {"ok": False, "error": str(e)}
+
+    if data.get("code") != 0:
+        return {"ok": False, "error": data.get("msg", "转移所有者失败"), "response": data}
+    return {"ok": True, "file_token": file_token, "new_owner": body, "response": data}
+
+
 def _members_map(members):
     result = {}
     for m in members or []:
@@ -2986,13 +3048,22 @@ def poll_file_deletions(folder_token=None, init_only=False):
 
 def poll_all_monitoring(folder_token=None, init_only=False):
     """执行一轮完整轮询：权限、删除、分享设置、评论"""
-    print(f"⏱️  开始轮询监听（间隔配置 {POLL_INTERVAL_SECONDS}s）")
+    doc_map = collect_docs_for_poll(folder_token)
+    print(f"⏱️  开始轮询监听（间隔配置 {POLL_INTERVAL_SECONDS}s，监控 {len(doc_map)} 个文档）")
+    if not doc_map:
+        print(
+            "⚠️  轮询文档列表为空：请配置 AUDIT_ROOT_FOLDER_TOKEN / AUDIT_DOC_TOKENS，"
+            "或先产生 Webhook 事件以登记 known_docs，然后执行 snapshot-init"
+        )
+    if init_only:
+        print("📸 本次为基线初始化（init_only），不会产生评论/权限/分享变更事件")
     perm = poll_permission_changes(folder_token, init_only=init_only)
     dele = poll_file_deletions(folder_token, init_only=init_only)
     share = poll_public_permission_changes(folder_token, init_only=init_only)
     comment = poll_comment_changes(folder_token, init_only=init_only)
     summary = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "documents_monitored": len(doc_map),
         "permission_poll": perm,
         "deletion_poll": dele,
         "share_poll": share,
@@ -3009,6 +3080,23 @@ def poll_all_monitoring(folder_token=None, init_only=False):
 
 
 _poll_thread_started = False
+
+
+def _poll_snapshots_need_init():
+    """轮询快照为空时需先建基线，否则首轮只能初始化、检测不到后续变更。"""
+    for path in (
+        PERMISSION_SNAPSHOT_FILE,
+        COMMENT_SNAPSHOT_FILE,
+        PUBLIC_PERM_SNAPSHOT_FILE,
+        FOLDER_FILES_SNAPSHOT_FILE,
+    ):
+        data = _load_json_file(path) or {}
+        if path == FOLDER_FILES_SNAPSHOT_FILE:
+            if not data.get("files"):
+                return True
+        elif not data.get("files"):
+            return True
+    return False
 
 
 def get_last_webhook_time():
@@ -3034,6 +3122,12 @@ def start_background_poller():
 
     def _loop():
         time.sleep(10)
+        if _poll_snapshots_need_init():
+            print("📸 检测到轮询快照为空，自动建立基线（不产生变更事件）...")
+            try:
+                poll_all_monitoring(init_only=True)
+            except Exception as e:
+                print(f"⚠️ 自动建立轮询基线失败: {e}")
         while True:
             try:
                 poll_all_monitoring()
@@ -3042,7 +3136,10 @@ def start_background_poller():
             time.sleep(POLL_INTERVAL_SECONDS)
 
     threading.Thread(target=_loop, daemon=True, name="poll-monitor").start()
-    print(f"🔄 已启动后台轮询线程，每 {POLL_INTERVAL_SECONDS} 秒检查权限/删除/分享/评论")
+    print(
+        f"🔄 已启动后台轮询线程，每 {POLL_INTERVAL_SECONDS} 秒检查权限/删除/分享/评论"
+        f"（首轮若刚建基线，需等下一轮或改权限/评论后才会产出事件）"
+    )
 
 
 # ==========================================
@@ -3612,9 +3709,19 @@ def poll_status_route():
     public_perm = _load_json_file(PUBLIC_PERM_SNAPSHOT_FILE) or {}
     comments = _load_json_file(COMMENT_SNAPSHOT_FILE) or {}
     content = _load_json_file(CONTENT_SNAPSHOT_FILE) or {}
+    monitored = collect_docs_for_poll()
     return jsonify({
         "poll_interval_seconds": POLL_INTERVAL_SECONDS,
         "auto_poll_on_start": AUTO_POLL_ON_START,
+        "documents_monitored": len(monitored),
+        "monitor_hint": (
+            None if monitored
+            else "轮询列表为空：请配置 AUDIT_ROOT_FOLDER_TOKEN / AUDIT_DOC_TOKENS，或执行 snapshot-init"
+        ),
+        "baseline_hint": (
+            "若刚执行 snapshot-init 或首轮自动建基线，需等待下一轮轮询或手动 POST /poll 才会发现新评论/权限变更"
+            if _poll_snapshots_need_init() else None
+        ),
         "permission_snapshot": {
             "updated_at": perm.get("updated_at"),
             "files_count": len(perm.get("files") or {}),
@@ -3768,6 +3875,12 @@ if __name__ == "__main__":
         if cmd == "audit" and len(sys.argv) >= 3:
             ftype = sys.argv[3] if len(sys.argv) > 3 else "docx"
             print(json.dumps(audit_file(sys.argv[2], file_type=ftype, source="cli"), ensure_ascii=False, indent=2))
+            sys.exit(0)
+
+        if cmd == "transfer-owner" and len(sys.argv) >= 4:
+            ftype = sys.argv[4] if len(sys.argv) >= 5 else "docx"
+            result = transfer_document_owner(sys.argv[2], ftype, sys.argv[3])
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             sys.exit(0)
 
     ensure_folder_subscribe_on_start()

@@ -15,6 +15,9 @@ AUDIT_WIKI_SEED_NODE = ""
 # 额外要审核的文档 token 列表
 AUDIT_DOC_TOKENS = []
 
+# 后台轮询间隔（秒）；演示建议 60，生产可用 300
+POLL_INTERVAL_SECONDS = 60
+
 # ---------- 审核未通过时的处理策略 ----------
 # 可选动作（可组合，逗号分隔或列表）：
 #   log_only  — 仅记录（默认）
